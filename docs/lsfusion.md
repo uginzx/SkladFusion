@@ -12,6 +12,8 @@
 | `SkladSync` | проход обмена целиком, задание планировщика, форма «Обмен со складом» |
 | `SkladTest` | верхний модуль для проверки: `MyCompanyRu` + обмен |
 
+Проверено: lsFusion 7.0 и MyCompany (ветка master) — все модули компилируются (проверка `settings.dryRun`, см. ниже). Нужны модули MyCompany для России (`LegalEntityRu`, верхний модуль `MyCompanyRu`).
+
 ## Подключение
 
 1. Положите модули рядом с модулями своей конфигурации и добавьте `SkladSync` в `REQUIRE` своего верхнего модуля (или запустите сервер с `-Dlogics.topModule=SkladTest` для пробы).
@@ -41,6 +43,20 @@
 Посылка не дошла — отпечатки не запоминаются, в следующем проходе уйдёт заново; сервер принимает повторы.
 
 ## Проверка
+
+### Компиляция без базы
+
+Режим `settings.dryRun` разбирает и проверяет все модули и завершается до подключения к базе (без портов, можно рядом с работающим сервером). Выход 0 и строка `Dry run finished successfully` — всё в порядке:
+
+```bash
+java -Dsettings.dryRun=true -Dlogics.topModule=SkladTest \
+  -cp <классы MyCompany>:<ресурсы>:<папка с .lsf MyCompany и lsfusion/>:<jar сервера lsFusion и зависимости> \
+  lsfusion.server.logics.BusinessLogicsBootstrap
+```
+
+В проекте Maven то же самое — запуск сервера приложений с параметром `-Dsettings.dryRun=true`.
+
+### Обмен целиком
 
 [`lsfusion/tests/`](../lsfusion/tests): `phone_scenario.php` изображает телефон (собирает заказ с фото, переставляет ячейки, вводит вес, снимает товар, создаёт заказы, проводит пересчёт) на тестовом сервере склада, `check.py` после одного прохода сверяет lsFusion и базу сервера. Порядок — в [`tests/README.md`](../lsfusion/tests/README.md).
 
