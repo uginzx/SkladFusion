@@ -1,0 +1,3 @@
+# /etc/cron.d/sklad — пример. Пользователь — тот же, под которым работает PHP-FPM (здесь www-data).
+# Фото товаров из каталога (config.php → photos.dir) раз в час; без каталога строку можно не добавлять.
+17 * * * * www-data php /var/www/sklad/bin/photos.php >> /var/log/sklad-photos.log 2>&1

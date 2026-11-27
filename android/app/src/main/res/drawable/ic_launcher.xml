@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Иконка: коробка на синем фоне. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#1F3A5F" />
+        </shape>
+    </item>
+    <item android:drawable="@drawable/ic_box" android:top="12dp" android:bottom="12dp" android:left="12dp" android:right="12dp" />
+</layer-list>

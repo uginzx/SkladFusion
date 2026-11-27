@@ -1,0 +1,326 @@
+// Обмен со складом по заказам покупателей: заказы к сборке → сервер; итоги сборки и фото коробок ← сервер;
+// новые заказы из приложения (черновики) и дозаказы в собираемый заказ ← сервер.
+MODULE SkladOrders;
+
+REQUIRE SkladItems, SalesOrderConfirmed, SalesOrderPricelist, SalesOrderShipment, SalesOrderType,
+        Individual, PartnerSales, Company;
+
+NAMESPACE Sklad;
+
+// ---- Заказы к сборке → push.orders: изменившиеся (по отпечатку) и remove — те, что больше не собирать;
+// раз в сутки — полный список (full: чего нет в списке, сервер снимает с телефонов)
+
+// собрать нужно то, что ещё не отгружено, по товарам (строки одного товара складываются)
+skladToShip (Sales.Order o, Product p) = GROUP SUM toShip(Sales.OrderLine l) IF order(l) = o AND shippedProduct(l) = p;
+skladPick (Sales.Order o) = skladActive(o) AND location(o) = skladStock() AND toShip(o) > 0;
+skladLine (Sales.Order o, Product p) = PARTITION SUM 1 IF skladToShip(o, p) > 0 ORDER name(p), p BY o;
+
+skladHash (Sales.Order o) = skladMd5(CONCAT r'|', number(o), STRING(dateTime(o)), nameCustomer(o), note(o), nameStatus(o),
+    (GROUP CONCAT guid(Product p) + r':' + STRING(skladToShip(o, p)) IF skladToShip(o, p) > 0, r',' ORDER guid(p), p));
+skladSentHash 'Отправлено на склад' = DATA STRING[32] (Sales.Order);
+// '-' — заказ больше не собирать: уходит в remove
+skladPushHash = DATA LOCAL NESTED STRING[32] (Sales.Order);
+
+skladMarkOrders () {
+    skladPushHash(Sales.Order o) <- (OVERRIDE (skladHash(o) IF skladPick(o)), r'-')
+        WHERE (skladPick(o) AND (skladFull() OR NOT skladHash(o) = skladSentHash(o))) OR (skladSentHash(o) AND NOT skladPick(o));
+}
+
+FORM skladOrdersOut
+    PROPERTIES() full = skladFull
+
+    OBJECTS items = Sales.Order
+    PROPERTIES(items) guid, number, date = dateTime, customer = nameCustomer, comment = note, state = nameStatus
+    FILTERS skladPick(items), skladPushHash(items)
+
+    OBJECTS lines = Product
+    PROPERTIES n = skladLine(items, lines), guid2 = guid(lines) EXTID 'guid', unit = skladUnit(lines), qty = skladToShip(items, lines)
+    FILTERS skladToShip(items, lines) > 0
+
+    OBJECTS remove = Sales.Order
+    PROPERTIES(remove) guid3 = guid EXTID 'value'
+    FILTERS skladPushHash(remove) = r'-'
+;
+
+// ---- Итоги сборки ← inbox.results: кто и когда собрал, сколько по каждому товару, фото коробки — к заказу.
+// Сам заказ не меняется: итог лежит рядом, отгрузку оформляет человек.
+
+skladPicker 'Собрал' = DATA ISTRING[100] (Sales.Order) CHARWIDTH 15;
+skladPickedAt 'Собран' = DATA DATETIME (Sales.Order);
+skladComplete 'Собран полностью' = DATA BOOLEAN (Sales.Order);
+skladPicked 'Собрано' = DATA NUMERIC[16,3] (Sales.Order, Product);
+skladPickNote 'Примечание сборщика' = DATA ISTRING[200] (Sales.Order, Product) CHARWIDTH 20;
+
+CLASS SkladOrderPhoto 'Фото сборки';
+TABLE skladOrderPhoto (SkladOrderPhoto);
+order 'Заказ' = DATA Sales.Order (SkladOrderPhoto) NONULL DELETE INDEXED;
+id 'Номер снимка на сервере' = DATA INTEGER (SkladOrderPhoto);
+photo 'Фото' = DATA IMAGEFILE (SkladOrderPhoto);
+skladOrderPhoto (INTEGER id) = GROUP AGGR SkladOrderPhoto f BY id(f);
+
+rGuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+rPicker = DATA LOCAL NESTED ISTRING[100] (INTEGER);
+rFinished = DATA LOCAL NESTED DATETIME (INTEGER);
+rComplete = DATA LOCAL NESTED BOOLEAN (INTEGER);
+rlOrder = DATA LOCAL NESTED INTEGER (INTEGER);
+rlGuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+rlQty = DATA LOCAL NESTED NUMERIC[16,3] (INTEGER);
+rlPicked = DATA LOCAL NESTED NUMERIC[16,3] (INTEGER);
+rlNote = DATA LOCAL NESTED ISTRING[200] (INTEGER);
+rpOrder = DATA LOCAL NESTED INTEGER (INTEGER);
+rpId = DATA LOCAL NESTED INTEGER (INTEGER);
+
+FORM skladResultsIn
+    OBJECTS items = INTEGER EXTID 'results'
+    PROPERTIES(items) guid = rGuid, picker = rPicker, finished = rFinished EXTID 'finished_at', complete = rComplete
+
+    OBJECTS lines = INTEGER
+    PROPERTIES(lines) lineGuid = rlGuid EXTID 'guid', qty = rlQty, picked = rlPicked, note = rlNote
+    FILTERS rlOrder(lines) = items
+
+    OBJECTS photos = INTEGER
+    PROPERTIES(photos) photoId = rpId EXTID 'value'
+    FILTERS rpOrder(photos) = items
+;
+
+skladReceiveResults () {
+    IMPORT skladResultsIn JSON FROM skladInbox();
+    IF NOT (GROUP SUM 1 IF rGuid(INTEGER i)) THEN RETURN;
+
+    LOCAL NESTED accepted = BOOLEAN (INTEGER);
+    FOR rGuid(INTEGER i) ORDER i DO {
+        IF NOT skladOrder(rGuid(i)) THEN
+            accepted(i) <- TRUE; // заказа нет — подтверждаем, иначе сервер отдавал бы его вечно
+        ELSE NEWSESSION {
+            FOR Sales.Order o = skladOrder(rGuid(i)) DO {
+                skladPicker(o) <- rPicker(i);
+                skladPickedAt(o) <- rFinished(i);
+                skladComplete(o) <- rComplete(i);
+                skladPicked(o, Product p) <- (GROUP SUM rlPicked(INTEGER j) IF rlOrder(j) = i AND skladProductGuid(rlGuid(j)) = p)
+                    WHERE (GROUP SUM 1 IF rlOrder(INTEGER j) = i AND skladProductGuid(rlGuid(j)) = p);
+                skladPickNote(o, Product p) <- (GROUP MAX rlNote(INTEGER j) IF rlOrder(j) = i AND skladProductGuid(rlGuid(j)) = p)
+                    WHERE (GROUP SUM 1 IF rlOrder(INTEGER j) = i AND skladProductGuid(rlGuid(j)) = p);
+                FOR rpOrder(INTEGER k) = i AND NOT skladOrderPhoto(rpId(k)) DO {
+                    skladGet(r'/api/erp/photo/' + rpId(k));
+                    NEW f = SkladOrderPhoto {
+                        order(f) <- o;
+                        id(f) <- rpId(k);
+                        photo(f) <- IMAGEFILE(skladResponse());
+                    }
+                }
+            }
+            APPLY;
+            IF canceled() THEN
+                skladFail(r'results', applyMessage());
+            ELSE
+                accepted(i) <- TRUE;
+        }
+    }
+    skladAckResults() <- JSON FROM guids = (JSON FROM value = rGuid(INTEGER i) WHERE accepted(i) ORDER i);
+}
+
+// ---- Новые заказы из приложения ← inbox.drafts → заказ покупателя с GUID черновика, подтверждённый
+// (резерв), → push.ack.drafts {uuid, number} или {uuid, error}. Повтор безопасен: заказ ищется по GUID.
+
+skladOrderType = DATA Sales.OrderType ();
+nameSkladOrderType 'Тип заказа из приложения' () = name(skladOrderType());
+skladConfirmNew 'Подтверждать заказы из приложения (резерв)' = DATA BOOLEAN ();
+
+skladAuthor 'Создан в приложении склада' = DATA ISTRING[100] (Sales.Order) CHARWIDTH 15;
+
+dfUuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+dfAuthor = DATA LOCAL NESTED ISTRING[100] (INTEGER);
+dfCustomer = DATA LOCAL NESTED STRING[36] (INTEGER);
+dfNewName = DATA LOCAL NESTED ISTRING[200] (INTEGER);
+dfNewPhone = DATA LOCAL NESTED ISTRING[50] (INTEGER);
+dfPriceType = DATA LOCAL NESTED STRING[36] (INTEGER);
+dfComment = DATA LOCAL NESTED TEXT (INTEGER);
+dlDraft = DATA LOCAL NESTED INTEGER (INTEGER);
+dlGuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+dlQty = DATA LOCAL NESTED NUMERIC[16,3] (INTEGER);
+dlPrice = DATA LOCAL NESTED NUMERIC[10,2] (INTEGER);
+
+GROUP customer_new;
+
+FORM skladDraftsIn
+    OBJECTS items = INTEGER EXTID 'drafts'
+    PROPERTIES(items) uuid = dfUuid, author = dfAuthor, customer = dfCustomer, price_type = dfPriceType, comment = dfComment
+    PROPERTIES(items) IN customer_new newName = dfNewName EXTID 'name', newPhone = dfNewPhone EXTID 'phone'
+
+    OBJECTS lines = INTEGER
+    PROPERTIES(lines) lineGuid = dlGuid EXTID 'guid', qty = dlQty, price = dlPrice
+    FILTERS dlDraft(lines) = items
+;
+
+dfNumber = DATA LOCAL NESTED STRING[50] (INTEGER);
+dfError = DATA LOCAL NESTED STRING[250] (INTEGER);
+
+// почему черновик нельзя провести; NULL — можно
+skladDraftProblem (INTEGER i) = CASE
+    WHEN NOT skladStock() THEN 'Не задан склад обмена'
+    WHEN NOT skladPriceTypeGuid(dfPriceType(i)) THEN 'Нет такого вида цен'
+    WHEN NOT skladPartner(dfCustomer(i)) AND NOT dfNewName(i) THEN 'Покупателя нет в учёте'
+    WHEN NOT (GROUP SUM 1 IF dlDraft(INTEGER j) = i) THEN 'В заказе нет строк'
+    WHEN (GROUP SUM 1 IF dlDraft(INTEGER j) = i AND NOT skladItem(dlGuid(j))) THEN 'Товара из заказа нет в учёте';
+
+skladNewCustomer (INTEGER i) {
+    NEW p = Individual {
+        skladId(p) <- dfCustomer(i);
+        lastName(p) <- ISTRING[30](dfNewName(i));
+        firstName(p) <- ISTRING[30](substrFrom(dfNewName(i), 31)) IF length(dfNewName(i)) > 30;
+        phone(p) <- ISTRING[100](dfNewPhone(i));
+        isCustomer(p) <- TRUE;
+    }
+}
+
+skladCreateOrder (INTEGER i) {
+    IF NOT skladPartner(dfCustomer(i)) THEN skladNewCustomer(i);
+    NEW o = Sales.Order {
+        skladId(o) <- dfUuid(i);
+        skladAuthor(o) <- dfAuthor(i);
+        type(o) <- OVERRIDE skladOrderType(), Sales.orderType(r'order');
+        company(o) <- OVERRIDE company(skladStock()), defaultCompany();
+        customer(o) <- skladPartner(dfCustomer(i));
+        location(o) <- skladStock();
+        // MyCompany при смене покупателя или типа ставит вид цен покупателя: сначала даём ему отработать
+        executeLocalEvents();
+        priceType(o) <- skladPriceTypeGuid(dfPriceType(i));
+        dateTime(o) <- currentDateTime();
+        scheduledDateTime(o) <- currentDateTime();
+        note(o) <- ISTRING(CONCAT '\n', (dfComment(i) IF dfComment(i) != ''), 'Создан в приложении SkladFusion: ' + dfAuthor(i),
+                           'Телефон: ' + (dfNewPhone(i) IF dfNewPhone(i) != ''));
+        FOR dlDraft(INTEGER j) = i NEW l = Sales.OrderLine DO {
+            order(l) <- o;
+            item(l) <- skladItem(dlGuid(j));
+            quantity(l) <- dlQty(j);
+            price(l) <- dlPrice(j);
+        }
+        IF NOT number(o) AND NOT numerator(type(o)) THEN number(o) <- STRING[50](r'СКЛ-' + left(dfUuid(i), 8));
+        IF skladConfirmNew() THEN confirmed(o) <- TRUE;
+    }
+}
+
+skladReceiveDrafts () {
+    IMPORT skladDraftsIn JSON FROM skladInbox();
+    IF NOT (GROUP SUM 1 IF dfUuid(INTEGER i)) THEN RETURN;
+
+    FOR dfUuid(INTEGER i) ORDER i DO {
+        IF skladOrder(dfUuid(i)) THEN
+            dfNumber(i) <- number(skladOrder(dfUuid(i)));
+        ELSE IF skladDraftProblem(i) THEN
+            dfError(i) <- STRING[250](skladDraftProblem(i));
+        ELSE NEWSESSION {
+            skladCreateOrder(i);
+            APPLY;
+            IF canceled() THEN
+                dfError(i) <- STRING[250](OVERRIDE applyMessage(), 'Заказ не записан');
+            ELSE
+                dfNumber(i) <- number(skladOrder(dfUuid(i)));
+        }
+    }
+    skladAckDrafts() <- JSON FROM items = (JSON FROM uuid = dfUuid(INTEGER i), number = dfNumber(i), error = dfError(i)
+                              WHERE dfNumber(i) OR dfError(i) ORDER i);
+}
+
+// ---- Дозаказ с телефона ← inbox.order_adds (сервер с дозаказами; без них ключа нет): товар в собираемый
+// заказ. Товар уже есть — растёт его строка, нет — новая строка по цене вида цен заказа. Отметка дозаказа хранится:
+// повтор после потерянного ответа строку не удваивает. → push.ack.order_adds {uuid, ok, error}.
+
+CLASS SkladOrderAdd 'Дозаказ со склада';
+TABLE skladOrderAdd (SkladOrderAdd);
+uuid 'Ключ' = DATA STRING[36] (SkladOrderAdd);
+skladOrderAdd (STRING[36] uuid) = GROUP AGGR SkladOrderAdd a BY uuid(a);
+order 'Заказ' = DATA Sales.Order (SkladOrderAdd) INDEXED;
+item 'Товар' = DATA Item (SkladOrderAdd);
+quantity 'Количество' = DATA NUMERIC[16,3] (SkladOrderAdd);
+author 'Кто' = DATA ISTRING[100] (SkladOrderAdd);
+dateTime 'Когда' = DATA DATETIME (SkladOrderAdd);
+
+aUuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+aOrder = DATA LOCAL NESTED STRING[36] (INTEGER);
+aGuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+aQty = DATA LOCAL NESTED NUMERIC[16,3] (INTEGER);
+aAuthor = DATA LOCAL NESTED ISTRING[100] (INTEGER);
+aOk = DATA LOCAL NESTED BOOLEAN (INTEGER);
+aError = DATA LOCAL NESTED STRING[240] (INTEGER);
+
+FORM skladAddsIn
+    OBJECTS items = INTEGER EXTID 'order_adds'
+    PROPERTIES(items) uuid = aUuid, order = aOrder, guid = aGuid, qty = aQty, author = aAuthor
+;
+
+skladAddLine (Sales.Order o, Item it) = GROUP MIN Sales.OrderLine l IF order(l) = o AND item(l) = it AND quantity(l) > 0;
+
+skladApplyAdd (INTEGER i, Sales.Order o, Item it) {
+    IF skladAddLine(o, it) THEN
+        quantity(Sales.OrderLine l) <- quantity(l) + aQty(i) WHERE l = skladAddLine(o, it);
+    ELSE NEW l = Sales.OrderLine {
+        order(l) <- o;
+        item(l) <- it;
+        quantity(l) <- aQty(i);
+        price(l) <- OVERRIDE priceA(priceType(o), it, currentDateTime()), priceA(skladPriceType(), it, currentDateTime());
+    }
+    note(o) <- ISTRING(CONCAT '\n', note(o), 'Дозаказ в приложении SkladFusion (' + aAuthor(i) + '): ' + name(it) + ' × ' + aQty(i));
+    NEW a = SkladOrderAdd {
+        uuid(a) <- aUuid(i);
+        order(a) <- o;
+        item(a) <- it;
+        quantity(a) <- aQty(i);
+        author(a) <- aAuthor(i);
+        dateTime(a) <- currentDateTime();
+    }
+}
+
+skladReceiveAdds () {
+    IMPORT skladAddsIn JSON FROM skladInbox();
+    IF NOT (GROUP SUM 1 IF aUuid(INTEGER i)) THEN RETURN;
+
+    FOR aUuid(INTEGER i) ORDER i DO {
+        IF skladOrderAdd(aUuid(i)) THEN
+            aOk(i) <- TRUE;
+        ELSE IF NOT skladOrder(aOrder(i)) THEN
+            aError(i) <- 'Заказа нет в учёте';
+        ELSE IF NOT skladItem(aGuid(i)) THEN
+            aError(i) <- 'Товара нет в учёте';
+        ELSE IF NOT (aQty(i) > 0) THEN
+            aError(i) <- 'Неверное количество';
+        ELSE NEWSESSION {
+            skladApplyAdd(i, skladOrder(aOrder(i)), skladItem(aGuid(i)));
+            APPLY;
+            IF canceled() THEN
+                aError(i) <- STRING[240](OVERRIDE applyMessage(), 'Дозаказ не записан');
+            ELSE
+                aOk(i) <- TRUE;
+        }
+    }
+    skladAckAdds() <- JSON FROM items = (JSON FROM uuid = aUuid(INTEGER i), ok = aOk(i), error = aError(i) WHERE aOk(i) OR aError(i) ORDER i);
+}
+
+// ---- В карточке заказа: итог сборки, фото, дозаказы
+
+EXTEND FORM Sales.order
+    PROPERTIES(o) READONLY skladPicker, skladPickedAt, skladComplete, skladAuthor
+
+    OBJECTS sp = SkladOrderPhoto
+    PROPERTIES(sp) READONLY id, photo
+    FILTERS order(sp) = o
+
+    OBJECTS sa = SkladOrderAdd
+    PROPERTIES(sa) READONLY dateTime, author, quantity
+    PROPERTIES READONLY nameItemAdd = name(item(sa))
+    FILTERS order(sa) = o
+;
+
+DESIGN Sales.order {
+    details {
+        NEW sklad {
+            caption = 'Склад';
+            MOVE PROPERTY(skladPicker(o));
+            MOVE PROPERTY(skladPickedAt(o));
+            MOVE PROPERTY(skladComplete(o));
+            MOVE PROPERTY(skladAuthor(o));
+            MOVE BOX(sp);
+            MOVE BOX(sa);
+        }
+    }
+}

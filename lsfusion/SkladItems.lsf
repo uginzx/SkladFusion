@@ -1,0 +1,247 @@
+// Обмен со складом по товарам: выгрузка номенклатуры (штрихкоды, остаток, заказано, цены, ячейка, производитель,
+// вес и габариты), покупателей и видов цен; обратно — ячейки, вес и габариты, фото товаров с телефона.
+MODULE SkladItems;
+
+REQUIRE Sklad, BarCode, Uom, ItemAttribute, SalesPricelistValue, SalesOrderShipment, PartnerSales,
+        LegalEntityRu, ItemImage;
+
+NAMESPACE Sklad;
+
+// ---- Товары → push.products: только изменившиеся (отпечаток skladHash не совпал с отправленным), раз в сутки — все
+
+skladProduct (Product p) = p IS Product AND NOT skladSkip(category(p));
+skladProductGuid (STRING g) = GROUP MAX Product p IF guid(p) = g AND p IS Product;
+skladUnit (Item i) = name(uom(i));
+skladUnit (BarCode b) = skladUnit(item(b));
+skladWeight (Product p) = OVERRIDE weight(p), 0.0;
+skladLength (Product p) = OVERRIDE length(p), 0.0;
+skladWidth (Product p) = OVERRIDE width(p), 0.0;
+skladHeight (Product p) = OVERRIDE height(p), 0.0;
+skladOnHand (Product p) = OVERRIDE onHandRec(skladStock(), p), 0.0;
+
+// «заказано» — не отгружено по заказам, которые идут на сборку (те же статусы и срок, что у выгрузки заказов)
+skladActive (Sales.Order o) = skladPick(status(o)) AND date(o) >= skladPickFrom();
+skladOrdered (Product p) = OVERRIDE (GROUP SUM toShip(Sales.OrderLine l) IF skladActive(order(l)) AND shippedProduct(l) = p), 0.0;
+skladPrice (Product p) = OVERRIDE priceA(skladPriceType(), p, currentDateTime()), 0.0;
+skladMaker (Item i) = OVERRIDE value(attribute(i, itemAttribute(r'BRAND'))), '';
+skladCell (Item i) = OVERRIDE name(mainBin(i)), '';
+
+// цена по виду цен нового заказа; ключ — GUID вида цен: в JSON это объект {"<guid>": цена}
+skladPrice (Product p, STRING[36] g) = priceA(skladPriceTypeGuid(g), p, currentDateTime()) IF skladOrderPriceType(skladPriceTypeGuid(g));
+
+// всё, что уходит на сервер по товару; изменилось что-то из этого — товар уйдёт в следующей посылке
+skladHash (Product p) = skladMd5(CONCAT r'|', id(p), reference(p), name(p), skladUnit(p), (r'a' IF archived(p)),
+    STRING(skladWeight(p)), STRING(skladLength(p)), STRING(skladWidth(p)), STRING(skladHeight(p)),
+    STRING(skladOnHand(p)), STRING(skladOrdered(p)), STRING(skladPrice(p)), skladCell(p), skladMaker(p),
+    (GROUP CONCAT id(BarCode b) IF item(b) = p, r',' ORDER id(b), b),
+    (GROUP CONCAT guid(Sales.PriceType t) + r':' + STRING(priceA(t, p, currentDateTime())) IF skladOrderPriceType(t), r',' ORDER guid(t), t));
+skladSentHash 'Отправлено на склад' = DATA STRING[32] (Product);
+// отпечаток того, что уходит в этой посылке; '-' — товар больше не выгружается: уходит снятым
+skladPushHash = DATA LOCAL NESTED STRING[32] (Product);
+
+FORM skladProductsOut
+    PROPERTIES() full = skladFull
+
+    OBJECTS items = Product
+    PROPERTIES(items) guid, code = id, sku = reference, name, unit = skladUnit, weight = skladWeight,
+                      length = skladLength, width = skladWidth, height = skladHeight,
+                      stock = skladOnHand, ordered = skladOrdered, price = skladPrice, cell = skladCell, maker = skladMaker
+    PROPERTIES deleted = (TRUE IF archived(items) OR skladPushHash(items) = r'-')
+    FILTERS skladPushHash(items)
+
+    OBJECTS barcodes = BarCode
+    PROPERTIES(barcodes) b = id, u = skladUnit
+    FILTERS item(barcodes) = items
+
+    OBJECTS prices = STRING[36] EXTKEY
+    PROPERTIES typePrice = skladPrice(items, prices) EXTID 'value'
+    FILTERS skladPrice(items, prices)
+
+    OBJECTS cells = Location
+    PROPERTIES(cells) binCode = name EXTID 'value'
+    FILTERS skladBin(cells)
+;
+
+skladMarkProducts () {
+    skladPushHash(Product p) <- (OVERRIDE (skladHash(p) IF skladProduct(p)), r'-')
+        WHERE (skladProduct(p) AND (skladFull() OR NOT skladHash(p) = skladSentHash(p))) OR (skladSentHash(p) AND NOT skladProduct(p));
+}
+
+// ---- Виды цен и покупатели для нового заказа из приложения → push.pricetypes (полный список), push.customers
+
+skladPriceTypesHash () = skladMd5(GROUP CONCAT guid(Sales.PriceType t) + r':' + name(t) IF skladOrderPriceType(t), r',' ORDER guid(t), t);
+skladSentPriceTypes 'Виды цен на складе' = DATA STRING[32] ();
+skladPushPriceTypes = DATA LOCAL NESTED BOOLEAN ();
+
+skladCustomer (Partner p) = isCustomer(p) AND NOT archived(p);
+skladHash (Partner p) = skladMd5(CONCAT r'|', name(p), phone(p), inn(p));
+skladSentHash 'Отправлено на склад' = DATA STRING[32] (Partner);
+skladPushHash = DATA LOCAL NESTED STRING[32] (Partner);
+
+skladMarkCustomers () {
+    skladPushHash(Partner p) <- (OVERRIDE (skladHash(p) IF skladCustomer(p)), r'-')
+        WHERE (skladCustomer(p) AND (skladFull() OR NOT skladHash(p) = skladSentHash(p))) OR (skladSentHash(p) AND NOT skladCustomer(p));
+    skladPushPriceTypes() <- TRUE IF skladPriceTypesHash() AND (skladFull() OR NOT skladPriceTypesHash() = skladSentPriceTypes());
+}
+
+// ---- Ячейки ← inbox.moved (места, переставленные на телефоне) и inbox.cells (все коды ячеек приложения).
+// Пишем, только если основная ячейка товара у нас всё ещё та, что была (was); иначе побеждает lsFusion —
+// его значение уйдёт с товарами. Новые коды заводятся местами склада.
+
+cGuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+cWas = DATA LOCAL NESTED STRING[30] (INTEGER);
+cCell = DATA LOCAL NESTED STRING[30] (INTEGER);
+cCode = DATA LOCAL NESTED STRING[30] (INTEGER);
+
+FORM skladCellsIn
+    OBJECTS items = INTEGER EXTID 'moved'
+    PROPERTIES(items) guid = cGuid, was = cWas, cell = cCell
+
+    OBJECTS cells = INTEGER
+    PROPERTIES(cells) code = cCode EXTID 'value'
+;
+
+// штрихкод ячейки как на сервере: «C» и код без знаков, кириллица как латиница; «07-3» — порядок обхода 703
+skladCellBarcode = FORMULA STRING[50] PG '\'C\' || regexp_replace(translate(upper($1), \'АВЕКМНОРСТХ\', \'ABEKMHOPCTX\'), \'[^A-Z0-9]\', \'\', \'g\')';
+skladCellWalk = FORMULA INTEGER PG 'CASE WHEN ($1) ~ \'^[0-9]{1,3}-[0-9]{1,2}$\' THEN split_part($1, \'-\', 1)::integer * 100 + split_part($1, \'-\', 2)::integer END';
+
+skladNewBin (Location l, TEXT code) {
+    name(l) <- ISTRING[30](code);
+    parent(l) <- skladStock();
+    company(l) <- company(skladStock());
+    barcode(l) <- skladCellBarcode(code);
+    walkOrder(l) <- skladCellWalk(code);
+    binNote(l) <- 'из приложения склада';
+}
+
+skladReceiveCells () {
+    IMPORT skladCellsIn JSON FROM skladInbox();
+    IF NOT skladStock() THEN RETURN;
+
+    LOCAL NESTED accepted = BOOLEAN (INTEGER);
+    FOR [GROUP SUM 1 BY skladUpper(trim(cCode(INTEGER j)))](TEXT code) AND code != '' AND NOT skladBinCode(code) NEW l = Location DO
+        skladNewBin(l, code);
+    FOR [GROUP SUM 1 BY skladUpper(trim(cCell(INTEGER j)))](TEXT code) AND code != '' AND NOT skladBinCode(code) NEW l = Location DO
+        skladNewBin(l, code);
+    accepted(INTEGER i) <- TRUE WHERE skladItem(cGuid(i)) AND
+        skladUpper(skladCell(skladItem(cGuid(i)))) = skladUpper(OVERRIDE cWas(i), '') AND
+        (cCell(i) = '' OR NOT cCell(i) OR skladBinCode(cCell(i)));
+    FOR accepted(INTEGER i) AND Item it = skladItem(cGuid(i)) DO {
+        mainBin(it) <- skladBinCode(cCell(i));
+        in(Location l, it) <- TRUE WHERE l = skladBinCode(cCell(i));
+    }
+    APPLY;
+    IF canceled() THEN {
+        skladFail(r'cells', applyMessage());
+        RETURN;
+    }
+    skladAckCells() <- JSON FROM items = (JSON FROM guid = cGuid(INTEGER i), cell = (OVERRIDE cCell(i), '') WHERE accepted(i) ORDER i);
+}
+
+// ---- Вес и габариты ← inbox.dims. Пишем, только если у товара всё ещё то, что было при правке (was);
+// в подтверждении — что теперь у товара и ver правки.
+
+dGuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+dWeight = DATA LOCAL NESTED NUMERIC[11,3] (INTEGER);
+dLength = DATA LOCAL NESTED NUMERIC[11,3] (INTEGER);
+dWidth = DATA LOCAL NESTED NUMERIC[11,3] (INTEGER);
+dHeight = DATA LOCAL NESTED NUMERIC[11,3] (INTEGER);
+dVer = DATA LOCAL NESTED INTEGER (INTEGER);
+dWasWeight = DATA LOCAL NESTED NUMERIC[11,3] (INTEGER);
+dWasLength = DATA LOCAL NESTED NUMERIC[11,3] (INTEGER);
+dWasWidth = DATA LOCAL NESTED NUMERIC[11,3] (INTEGER);
+dWasHeight = DATA LOCAL NESTED NUMERIC[11,3] (INTEGER);
+
+GROUP was;
+
+FORM skladDimsIn
+    OBJECTS items = INTEGER EXTID 'dims'
+    PROPERTIES(items) guid = dGuid, weight = dWeight, length = dLength, width = dWidth, height = dHeight, ver = dVer
+    PROPERTIES(items) IN was weight2 = dWasWeight EXTID 'weight', length2 = dWasLength EXTID 'length',
+                             width2 = dWasWidth EXTID 'width', height2 = dWasHeight EXTID 'height'
+;
+
+skladSameDims (Product p, INTEGER i) =
+    round3(skladWeight(p)) = round3(OVERRIDE dWasWeight(i), 0.0) AND round1(skladLength(p)) = round1(OVERRIDE dWasLength(i), 0.0) AND
+    round1(skladWidth(p)) = round1(OVERRIDE dWasWidth(i), 0.0) AND round1(skladHeight(p)) = round1(OVERRIDE dWasHeight(i), 0.0);
+
+skladReceiveDims () {
+    IMPORT skladDimsIn JSON FROM skladInbox();
+    IF NOT (GROUP SUM 1 IF dGuid(INTEGER i)) THEN RETURN;
+
+    FOR Product p = skladProductGuid(dGuid(INTEGER i)) AND
+        (NOT (dWasWeight(i) OR dWasLength(i) OR dWasWidth(i) OR dWasHeight(i)) OR skladSameDims(p, i)) DO {
+        weight(p) <- dWeight(i) IF dWeight(i) > 0;
+        length(p) <- dLength(i) IF dLength(i) > 0;
+        width(p) <- dWidth(i) IF dWidth(i) > 0;
+        height(p) <- dHeight(i) IF dHeight(i) > 0;
+        volume(p) <- NUMERIC[11,3](dLength(i) * dWidth(i) * dHeight(i) / 1000000) IF dLength(i) * dWidth(i) * dHeight(i) > 0;
+    }
+    APPLY;
+    IF canceled() THEN {
+        skladFail(r'dims', applyMessage());
+        RETURN;
+    }
+    skladAckDims() <- JSON FROM items = (JSON FROM guid = dGuid(INTEGER i), ver = dVer(i), weight = skladWeight(skladProductGuid(dGuid(i))),
+                              length = skladLength(skladProductGuid(dGuid(i))), width = skladWidth(skladProductGuid(dGuid(i))),
+                              height = skladHeight(skladProductGuid(dGuid(i)))
+                              WHERE skladProductGuid(dGuid(i)) ORDER i);
+}
+
+// ---- Фото товаров ← inbox.product_photos: каждый снимок хранится у товара (SkladItemPhoto), а если у товара
+// ещё нет картинки (image из ItemImage) — становится ею. Ключ — id снимка на сервере: если подтверждение не дошло,
+// повтор находит уже записанное и только подтверждает.
+
+CLASS SkladItemPhoto 'Фото товара с телефона';
+TABLE skladItemPhoto (SkladItemPhoto);
+
+item 'Товар' = DATA Item (SkladItemPhoto) NONULL DELETE INDEXED;
+skladPhotoId 'Номер на сервере склада' = DATA INTEGER (SkladItemPhoto);
+skladItemPhoto (INTEGER id) = GROUP AGGR SkladItemPhoto m BY skladPhotoId(m);
+photo 'Фото' = DATA IMAGEFILE (SkladItemPhoto);
+dateTime 'Когда' = DATA DATETIME (SkladItemPhoto);
+
+pId = DATA LOCAL NESTED INTEGER (INTEGER);
+pGuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+
+FORM skladPhotosIn
+    OBJECTS items = INTEGER EXTID 'product_photos'
+    PROPERTIES(items) id = pId, guid = pGuid
+;
+
+pDone = DATA LOCAL NESTED BOOLEAN (INTEGER);
+
+skladReceivePhotos () {
+    IMPORT skladPhotosIn JSON FROM skladInbox();
+    FOR pId(INTEGER i) ORDER i DO {
+        IF NOT skladItem(pGuid(i)) OR skladItemPhoto(pId(i)) THEN { // нет товара или уже записано
+            pDone(i) <- TRUE;
+        } ELSE {
+            skladGet(r'/api/erp/product_photo/' + pId(i));
+            NEWSESSION {
+                FOR Item it = skladItem(pGuid(i)) NEW m = SkladItemPhoto DO {
+                    skladPhotoId(m) <- pId(i);
+                    item(m) <- it;
+                    photo(m) <- IMAGEFILE(skladResponse());
+                    dateTime(m) <- currentDateTime();
+                    IF NOT image(it) THEN
+                        image(it) <- photo(m);
+                }
+                APPLY;
+                IF canceled() THEN
+                    skladFail(r'photos', applyMessage());
+                ELSE
+                    pDone(i) <- TRUE;
+            }
+        }
+    }
+    skladAckPhotos() <- JSON FROM ids = (JSON FROM value = pId(INTEGER i) WHERE pDone(i) ORDER i);
+}
+
+EXTEND FORM item
+    OBJECTS skp = SkladItemPhoto
+    PROPERTIES(skp) READONLY dateTime, photo
+    PROPERTIES(skp) DELETE
+    FILTERS item(skp) = i
+    ORDERS dateTime(skp) DESC
+;

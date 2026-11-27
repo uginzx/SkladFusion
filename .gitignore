@@ -1,0 +1,4 @@
+*.apk
+server/config.php
+server/tests/config.php
+android/.kotlin/

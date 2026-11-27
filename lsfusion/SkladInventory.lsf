@@ -1,0 +1,79 @@
+// Пересчёты из приложения склада ← inbox.inventories: по каждому — проведённая инвентаризация MyCompany
+// (Adjustment) на складе обмена. Учёт — текущий остаток, факт = max(0, текущий + delta): за время пересчёта могли
+// быть продажи. Повтор безопасен: инвентаризация ищется по id пересчёта.
+// → push.ack.inventories {id, ok, docs: {inv}} или {id, ok: false, error}. Новые остатки уходят той же посылкой.
+MODULE SkladInventory;
+
+REQUIRE SkladItems, Adjustment, AdjustmentInProgress, AdjustmentDone;
+
+NAMESPACE Sklad;
+
+skladId 'Пересчёт приложения склада' = DATA STRING[36] (Adjustment) CHARWIDTH 36;
+skladAdjustment (STRING[36] id) = GROUP AGGR Adjustment a BY skladId(a);
+
+iId = DATA LOCAL NESTED STRING[36] (INTEGER);
+iMaker = DATA LOCAL NESTED ISTRING[150] (INTEGER);
+iUser = DATA LOCAL NESTED ISTRING[100] (INTEGER);
+ilInv = DATA LOCAL NESTED INTEGER (INTEGER);
+ilGuid = DATA LOCAL NESTED STRING[36] (INTEGER);
+ilSku = DATA LOCAL NESTED STRING[100] (INTEGER);
+ilDelta = DATA LOCAL NESTED NUMERIC[16,3] (INTEGER);
+FORM skladInventoriesIn
+    OBJECTS items = INTEGER EXTID 'inventories'
+    PROPERTIES(items) id = iId, maker = iMaker, user = iUser
+
+    OBJECTS lines = INTEGER
+    PROPERTIES(lines) guid = ilGuid, sku = ilSku, delta = ilDelta
+    FILTERS ilInv(lines) = items
+;
+
+iNumber = DATA LOCAL NESTED STRING[50] (INTEGER);
+iError = DATA LOCAL NESTED STRING[480] (INTEGER);
+
+skladDelta (INTEGER i, Product p) = GROUP SUM ilDelta(INTEGER j) IF ilInv(j) = i AND skladProductGuid(ilGuid(j)) = p;
+
+skladInventoryProblem (INTEGER i) = CASE
+    WHEN NOT skladStock() THEN 'Не задан склад обмена'
+    WHEN NOT (GROUP SUM 1 IF ilInv(INTEGER j) = i) THEN 'В пересчёте нет строк'
+    WHEN (GROUP SUM 1 IF ilInv(INTEGER j) = i AND NOT skladProductGuid(ilGuid(j))) THEN
+        'Товара нет в учёте: ' + (GROUP CONCAT ilSku(INTEGER j) IF ilInv(j) = i AND NOT skladProductGuid(ilGuid(j)), ', ' ORDER j);
+
+skladCreateAdjustment (INTEGER i) {
+    NEW a = Adjustment {
+        skladId(a) <- iId(i);
+        location(a) <- skladStock();
+        type(a) <- AdjustmentType.manual;
+        dateTime(a) <- currentDateTime();
+        note(a) <- ISTRING[50]('Пересчёт ' + iMaker(i) + ', ' + iUser(i));
+        FOR skladDelta(i, Product p) NEW l = AdjustmentLine DO {
+            adjustment(l) <- a;
+            product(l) <- p;
+            location(l) <- skladStock();
+            theoreticalQuantity(l) <- OVERRIDE onHand(skladStock(), p), 0.0;
+            realQuantity(l) <- NUMERIC[16,3](MAX (OVERRIDE onHand(skladStock(), p), 0.0) (+) skladDelta(i, p), 0.0);
+        }
+        done(a) <- TRUE;
+    }
+}
+
+skladReceiveInventories () {
+    IMPORT skladInventoriesIn JSON FROM skladInbox();
+    IF NOT (GROUP SUM 1 IF iId(INTEGER i)) THEN RETURN;
+
+    FOR iId(INTEGER i) ORDER i DO {
+        IF skladAdjustment(iId(i)) THEN
+            iNumber(i) <- number(skladAdjustment(iId(i)));
+        ELSE IF skladInventoryProblem(i) THEN
+            iError(i) <- STRING[480](skladInventoryProblem(i));
+        ELSE NEWSESSION {
+            skladCreateAdjustment(i);
+            APPLY;
+            IF canceled() THEN
+                iError(i) <- STRING[480](OVERRIDE applyMessage(), 'Инвентаризация не записана');
+            ELSE
+                iNumber(i) <- number(skladAdjustment(iId(i)));
+        }
+    }
+    skladAckInventories() <- JSON FROM items = (JSON FROM id = iId(INTEGER i), ok = (TRUE IF iNumber(i)), docs = (JSON FROM inv = iNumber(i)),
+                              error = iError(i) WHERE iNumber(i) OR iError(i) ORDER i);
+}

@@ -1,0 +1,152 @@
+// Обмен со складом целиком. Проход: inbox (сервер держит запрос до skladWait секунд, пока с телефонов ничего нет) →
+// шаги приёма, каждый в своей сессии (ошибка одного пишется в журнал и не мешает остальным) → push: подтверждения
+// принятого и всё, что изменилось в учёте (отпечаток не совпал с отправленным), раз в сутки — всё. Посылка дошла —
+// отпечатки запоминаются; не дошла — в следующем проходе уйдёт заново (сервер принимает повторы).
+// Задание планировщика запускает проходы один за другим, поэтому новое с телефона приходит в учёт за секунды, а
+// изменение в учёте уходит на склад не позже чем через skladWait секунд.
+MODULE SkladSync;
+
+REQUIRE Scheduler, SkladItems, SkladOrders, SkladInventory;
+
+NAMESPACE Sklad;
+
+skladPush () {
+    skladMarkCustomers();
+    skladMarkOrders();
+    skladMarkProducts();
+    LOCAL f = FILE ();
+    EXPORT JSON FROM
+        ack = (JSON FROM drafts = skladAckDrafts(), order_adds = skladAckAdds(), results = skladAckResults(),
+               cells = skladAckCells(), dims = skladAckDims(), product_photos = skladAckPhotos(),
+               inventories = skladAckInventories()),
+        pricetypes = ((JSON FROM items = (JSON FROM guid = guid(Sales.PriceType t), name = name(t)
+                                         WHERE skladOrderPriceType(t) ORDER name(t), t)) IF skladPushPriceTypes()),
+        customers = (JSON FROM full = skladFull(),
+                     items = (JSON FROM guid = guid(Partner p), name = name(p), phone = (OVERRIDE phone(p), ''),
+                              inn = (OVERRIDE inn(p), ''), deleted = (TRUE IF skladPushHash(p) = r'-')
+                              WHERE skladPushHash(p) ORDER p)),
+        orders = JSON(skladOrdersOut),
+        products = JSON(skladProductsOut)
+        TO f;
+    skladPost(r'/api/erp/push', f());
+    NEWSESSION {
+        skladSentHash(Product p) <- (skladPushHash(p) IF NOT skladPushHash(p) = r'-') WHERE skladPushHash(p);
+        skladSentHash(Sales.Order o) <- (skladPushHash(o) IF NOT skladPushHash(o) = r'-') WHERE skladPushHash(o);
+        skladSentHash(Partner c) <- (skladPushHash(c) IF NOT skladPushHash(c) = r'-') WHERE skladPushHash(c);
+        IF skladPushPriceTypes() THEN skladSentPriceTypes() <- skladPriceTypesHash();
+        IF skladFull() THEN skladLastFull() <- currentDateTime();
+        APPLY;
+    }
+}
+
+skladSync 'Обменяться со складом сейчас' () {
+    IF NOT skladOn() OR NOT skladKey() OR NOT skladUrl() THEN RETURN;
+
+    TRY {
+        skladGet(r'/api/erp/inbox?wait=' + (OVERRIDE skladWait(), 10));
+        skladInbox() <- skladResponse();
+        skladOk(r'inbox');
+    } CATCH {
+        skladFail(r'inbox', messageCaughtException());
+        RETURN;
+    }
+    // сначала новые заказы и добавленные в заказ товары: созданное уйдёт на склад этой же посылкой
+    NEWSESSION TRY { skladReceiveDrafts(); skladOk(r'drafts'); } CATCH skladFail(r'drafts', messageCaughtException());
+    NEWSESSION TRY { skladReceiveAdds(); skladOk(r'order_adds'); } CATCH skladFail(r'order_adds', messageCaughtException());
+    NEWSESSION TRY { skladReceiveResults(); skladOk(r'results'); } CATCH skladFail(r'results', messageCaughtException());
+    NEWSESSION TRY { skladReceiveCells(); skladOk(r'cells'); } CATCH skladFail(r'cells', messageCaughtException());
+    NEWSESSION TRY { skladReceiveDims(); skladOk(r'dims'); } CATCH skladFail(r'dims', messageCaughtException());
+    NEWSESSION TRY { skladReceivePhotos(); skladOk(r'photos'); } CATCH skladFail(r'photos', messageCaughtException());
+    NEWSESSION TRY { skladReceiveInventories(); skladOk(r'inventories'); } CATCH skladFail(r'inventories', messageCaughtException());
+
+    skladFull() <- TRUE IF NOT skladLastFull() OR NOT (currentDateTime() < sumMinutes(skladLastFull(), 1440));
+    NEWSESSION TRY { skladPush(); skladOk(r'push'); } CATCH skladFail(r'push', messageCaughtException());
+
+    NEWSESSION {
+        skladLastRun() <- currentDateTime();
+        APPLY;
+    }
+}
+
+// задание планировщика: проходы один за другим (через секунду после окончания прошлого); действие задаётся
+// текстом (script), поэтому работает и при «лёгком» старте сервера
+skladSetupScheduler 'Включить обмен' () {
+    NEWSESSION {
+        IF NOT scheduledTask(r'Обмен со складом') THEN NEW s = UserScheduledTask {
+            name(s) <- r'Обмен со складом';
+            startDate(s) <- currentDateTime();
+            period(s) <- 1;
+            schedulerStartType(s) <- SchedulerStartType.afterFinish;
+            NEW dt = UserScheduledTaskDetail {
+                scheduledTask(dt) <- s;
+                script(dt) <- r'Sklad.skladSync();';
+                order(dt) <- 0;
+                active(dt) <- TRUE;
+            }
+        }
+        period(scheduledTask(r'Обмен со складом')) <- 1;
+        active(scheduledTask(r'Обмен со складом')) <- TRUE;
+        skladOn() <- TRUE;
+        APPLY;
+    }
+}
+
+// ---- Настройки и состояние обмена
+
+FORM skladExchange 'Обмен со складом'
+    PROPERTIES() skladOn, skladUrl, skladKey, skladWait, nameSkladStock, nameSkladPriceType, nameSkladOrderType, skladConfirmNew,
+                 skladPickDays, skladSync, skladSetupScheduler
+    PROPERTIES() READONLY skladLastRun, skladLastFull
+
+    OBJECTS st = Sales.OrderStatus
+    PROPERTIES(st) READONLY caption
+    PROPERTIES(st) skladPick
+
+    OBJECTS pt = Sales.PriceType
+    PROPERTIES(pt) READONLY name
+    PROPERTIES(pt) skladOrderPriceType
+
+    OBJECTS er = STRING[30]
+    PROPERTIES(er) READONLY skladError, skladErrorAt
+    FILTERS skladError(er)
+;
+
+DESIGN skladExchange {
+    OBJECTS {
+        NEW settings FIRST {
+            horizontal = TRUE;
+            NEW connection {
+                caption = 'Подключение';
+                MOVE PROPERTY(skladOn());
+                MOVE PROPERTY(skladUrl());
+                MOVE PROPERTY(skladKey());
+                MOVE PROPERTY(skladWait());
+                MOVE PROPERTY(skladSync());
+                MOVE PROPERTY(skladSetupScheduler());
+                MOVE PROPERTY(skladLastRun());
+                MOVE PROPERTY(skladLastFull());
+            }
+            NEW data {
+                caption = 'Учёт';
+                MOVE PROPERTY(nameSkladStock());
+                MOVE PROPERTY(nameSkladPriceType());
+                MOVE PROPERTY(nameSkladOrderType());
+                MOVE PROPERTY(skladConfirmNew());
+                MOVE PROPERTY(skladPickDays());
+            }
+        }
+        NEW lists AFTER settings {
+            horizontal = TRUE;
+            fill = 1;
+            MOVE BOX(st) { caption = 'Какие заказы собирать'; }
+            MOVE BOX(pt) { caption = 'Виды цен в новом заказе'; }
+        }
+        MOVE BOX(er) { caption = 'Ошибки обмена'; }
+    }
+}
+
+NAVIGATOR {
+    masterData {
+        NEW skladExchange;
+    }
+}

@@ -1,0 +1,5 @@
+// Верхний модуль для проверки: MyCompany (с модулями для России) и обмен со складом.
+// Запуск сервера lsFusion с -Dlogics.topModule=SkladTest (см. tests/README.md).
+MODULE SkladTest;
+
+REQUIRE MyCompanyRu, SkladSync;

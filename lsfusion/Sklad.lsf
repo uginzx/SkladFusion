@@ -1,0 +1,135 @@
+// Обмен lsFusion (MyCompany) с сервером склада — основа: настройки, ключи объектов, вызовы сервера.
+// Обмен — два запроса за проход (/api/erp): inbox — всё, что пришло с телефонов (сервер держит запрос, пока не
+// появится), и push — подтверждения принятого и всё, что изменилось в учёте с прошлой посылки (по отпечатку),
+// раз в сутки — полная сверка. Ключ объекта для сервера (guid) — внешний GUID (skladExtId: например, GUID из другой системы,
+// если объекты загружены из неё), иначе GUID, выданный приложением склада (skladId), иначе постоянный GUID из
+// внутреннего номера объекта.
+MODULE Sklad;
+
+REQUIRE System, Utils, Time, Item, Product, Location, InvLedger, Partner, SalesPriceType, SalesOrder,
+        SkladBins;
+
+NAMESPACE Sklad;
+
+// ---- Настройки
+
+skladUrl 'Адрес сервера склада' = DATA STRING[200] () CHARWIDTH 30;
+skladBaseUrl () = skladUrl();
+skladKey 'Ключ обмена (X-Sync-Key)' = DATA STRING[100] () CHARWIDTH 30;
+skladOn 'Обмен включён' = DATA BOOLEAN ();
+// сколько секунд сервер держит inbox, если с телефонов ничего нет: столько же ждут и изменения учёта
+skladWait 'Ожидание, с' = DATA INTEGER ();
+
+// склад, остатки и ячейки которого видит приложение; его дочерние места — ячейки
+skladStock = DATA Location ();
+nameSkladStock 'Склад' () = name(skladStock());
+
+// вид цен «Цена» в карточке товара и виды цен, доступные в новом заказе из приложения
+skladPriceType = DATA Sales.PriceType ();
+nameSkladPriceType 'Вид цен для приложения' () = name(skladPriceType());
+skladOrderPriceType 'Доступен в новом заказе из приложения' = DATA BOOLEAN (Sales.PriceType);
+
+// какие заказы идут на сборку: по статусу и не старше N дней
+skladPick 'Отдавать на сборку' = DATA BOOLEAN (Sales.OrderStatus);
+skladPickDays 'Заказы не старше, дней' = DATA INTEGER ();
+skladPickFrom () = subtract(currentDate(), OVERRIDE skladPickDays(), 60);
+
+// товары, которые не уходят в приложение (например, категория предзаказа без остатков)
+skladSkip 'Не выгружать в приложение склада' = DATA BOOLEAN (Category);
+
+// ---- Ключи объектов для сервера
+
+// постоянный GUID из внутреннего номера объекта: для объектов, у которых нет ни внешнего GUID, ни GUID приложения
+skladHashGuid = FORMULA STRING[36] PG 'CAST(md5(CAST(($1) AS text) || CAST(($2) AS text)) AS uuid)::text';
+
+// Внешние GUID, если объекты пришли из другой системы. Свой модуль может их задать, например:
+//     skladExtId(Item i) += extGuid(i);
+skladExtId = ABSTRACT STRING[36] (Item);
+skladExtId = ABSTRACT STRING[36] (Partner);
+skladExtId = ABSTRACT STRING[36] (Sales.Order);
+
+skladId 'GUID приложения склада' = DATA STRING[36] (Item) CHARWIDTH 36;
+guid 'Ключ для склада' (Item i) = OVERRIDE skladExtId(i), skladId(i), (skladHashGuid(r'item', i) IF i IS Item) MATERIALIZED INDEXED CHARWIDTH 36;
+skladItem (STRING g) = GROUP MAX Item i IF guid(i) = g;
+
+skladId 'GUID приложения склада' = DATA STRING[36] (Partner) CHARWIDTH 36;
+guid 'Ключ для склада' (Partner p) = OVERRIDE skladExtId(p), skladId(p), (skladHashGuid(r'partner', p) IF p IS Partner) MATERIALIZED INDEXED CHARWIDTH 36;
+skladPartner (STRING g) = GROUP MAX Partner p IF guid(p) = g;
+
+// заказ, созданный из приложения, получает GUID черновика: так сервер узнаёт в нём свой черновик
+skladId 'GUID приложения склада' = DATA STRING[36] (Sales.Order) CHARWIDTH 36;
+guid 'Ключ для склада' (Sales.Order o) = OVERRIDE skladExtId(o), skladId(o), (skladHashGuid(r'order', o) IF o IS Sales.Order) MATERIALIZED INDEXED CHARWIDTH 36;
+skladOrder (STRING g) = GROUP MAX Sales.Order o IF guid(o) = g;
+
+guid 'Ключ для склада' (Sales.PriceType t) = skladHashGuid(r'pricetype', t) IF t IS Sales.PriceType MATERIALIZED INDEXED CHARWIDTH 36;
+skladPriceTypeGuid (STRING g) = GROUP MAX Sales.PriceType t IF guid(t) = g;
+
+// ячейка — дочернее место склада, её код для приложения — имя места
+skladBin (Location l) = parent(l) = skladStock() AND NOT archived(l);
+skladUpper = FORMULA TEXT 'upper($1)';
+skladBinCode (STRING code) = GROUP MAX Location l IF skladBin(l) AND skladUpper(name(l)) = skladUpper(code);
+
+// ---- Вызовы сервера
+
+skladHeaders = DATA LOCAL TEXT (TEXT);
+skladResponse = DATA LOCAL NESTED FILE ();
+// выдача сервера за этот проход: каждый шаг импортирует из неё свою часть
+skladInbox = DATA LOCAL NESTED FILE ();
+// подтверждения шагов за этот проход: уходят на сервер в push
+skladAckDrafts = DATA LOCAL NESTED JSON ();
+skladAckAdds = DATA LOCAL NESTED JSON ();
+skladAckResults = DATA LOCAL NESTED JSON ();
+skladAckCells = DATA LOCAL NESTED JSON ();
+skladAckDims = DATA LOCAL NESTED JSON ();
+skladAckPhotos = DATA LOCAL NESTED JSON ();
+skladAckInventories = DATA LOCAL NESTED JSON ();
+// полная сверка в этом проходе (раз в сутки): уходит всё, а не только изменившееся
+skladFull = DATA LOCAL NESTED BOOLEAN ();
+
+// отпечаток состояния объекта: изменился — объект уходит на сервер
+skladMd5 = FORMULA STRING[32] PG 'md5($1)';
+
+skladSetHeaders () {
+    skladHeaders(TEXT h) <- NULL;
+    skladHeaders(r'X-Sync-Key') <- skladKey();
+    skladHeaders(r'Accept') <- r'application/json';
+    timeoutHttp() <- 60000 + 1000 * (OVERRIDE skladWait(), 10);
+}
+
+// ответ — в skladResponse(); не 2xx и сбой сети — исключение с кодом и началом ответа
+skladGet (STRING path) {
+    skladSetHeaders();
+    skladResponse() <- NULL;
+    EXTERNAL HTTP GET skladBaseUrl() + path HEADERS skladHeaders TO skladResponse;
+}
+
+skladPost (STRING path, FILE body) {
+    skladSetHeaders();
+    skladHeaders(r'Content-Type') <- r'application/json';
+    skladResponse() <- NULL;
+    EXTERNAL HTTP POST skladBaseUrl() + path HEADERS skladHeaders PARAMS body TO skladResponse;
+}
+
+// ---- Журнал: последняя ошибка каждого шага, время последнего прохода
+
+skladError 'Последняя ошибка' = DATA TEXT (STRING[30]);
+skladErrorAt 'Когда' = DATA DATETIME (STRING[30]);
+skladLastRun 'Последний обмен' = DATA DATETIME ();
+skladLastFull 'Последняя полная сверка' = DATA DATETIME ();
+
+skladFail (STRING[30] step, TEXT message) {
+    printToLog(TEXT('Склад, ' + step + ': ' + message), r'system', r'error');
+    NEWSESSION {
+        skladError(step) <- message;
+        skladErrorAt(step) <- currentDateTime();
+        APPLY;
+    }
+}
+
+skladOk (STRING[30] step) {
+    IF skladError(step) THEN NEWSESSION {
+        skladError(step) <- NULL;
+        skladErrorAt(step) <- NULL;
+        APPLY;
+    }
+}

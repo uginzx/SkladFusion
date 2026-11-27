@@ -1,0 +1,30 @@
+// Адресное хранение поверх мест MyCompany: ячейки — дочерние места склада (Location). У ячейки штрихкод, порядок
+// обхода и примечание; товар может лежать в нескольких ячейках, одна из них — основная.
+// Если в вашей конфигурации ячейки уже есть, замените этот модуль своим с теми же свойствами.
+MODULE SkladBins;
+
+REQUIRE Item, Location;
+
+NAMESPACE Sklad;
+
+barcode 'Штрихкод ячейки' = DATA STRING[50] (Location) CHARWIDTH 8;
+walkOrder 'Порядок обхода' = DATA INTEGER (Location);
+binNote 'Примечание' = DATA ISTRING[200] (Location) CHARWIDTH 30;
+
+TABLE skladLocationItem (Location, Item);
+in 'Лежит в ячейке' = DATA BOOLEAN (Location, Item) TABLE skladLocationItem;
+
+mainBin 'Основная ячейка' = DATA Location (Item);
+nameMainBin 'Основная ячейка' (Item i) = name(mainBin(i));
+bins 'Ячейки' (Item i) = GROUP CONCAT name(Location l) IF in(l, i), ', ' ORDER walkOrder(l), l CHARWIDTH 15;
+countItems 'Товаров в ячейке' (Location l) = GROUP SUM 1 IF in(l, Item i);
+
+EXTEND FORM location
+    PROPERTIES(l) barcode, walkOrder, binNote
+    PROPERTIES(l) READONLY countItems
+;
+
+EXTEND FORM item
+    PROPERTIES(i) nameMainBin
+    PROPERTIES(i) READONLY bins
+;

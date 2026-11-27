@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Задания склада</title>
+<meta name="theme-color" content="#16202b">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<style>
+/* Layout: «планшет склада» — шапка со связью и счётчиками, вкладки по направлению, карточки заданий: слева позиции и итог, справа переписка */
+:root {
+  --bg: #eef1f4; --surface: #ffffff; --ink: #16202b; --muted: #5b6774; --line: #d3d9e0;
+  --signal: #f2b705; --signal-ink: #1b1600; --work: #1f6fd1; --done: #1d8a4e; --late: #c4361f;
+  --field: #f6f8fa; --owner: #7a4fc9; --mine: #fff6d6;
+  --font-body: "Segoe UI", "Golos Text", Roboto, system-ui, sans-serif;
+  --font-mono: Consolas, "Cascadia Mono", "JetBrains Mono", ui-monospace, monospace;
+  --r: 10px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root {
+  --bg: #11161c; --surface: #19212a; --ink: #e6ebf0; --muted: #94a1ae; --line: #2c3743;
+  --signal: #f5c22b; --signal-ink: #1b1600; --work: #5ea2f2; --done: #4cc382; --late: #f0725c; --field: #121920;
+  --owner: #b393f0; --mine: #2b2814; color-scheme: dark } }
+
+* { box-sizing: border-box }
+[hidden] { display: none !important }
+html { padding-top: env(safe-area-inset-top, 0px) }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--font-body);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 0 48px }
+.wrap { max-width: 1100px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px }
+
+header { padding-top: 18px; display: flex; flex-direction: column; gap: 12px }
+.tape { height: 8px; border-radius: 4px; background: repeating-linear-gradient(-45deg, var(--signal) 0 14px, var(--ink) 14px 28px) }
+.head-row { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px }
+h1 { margin: 0; font-size: 26px; line-height: 1.15; font-weight: 700; text-wrap: balance }
+h1 small { display: block; font-size: 13px; font-weight: 600; color: var(--muted); letter-spacing: 0.05em; text-transform: uppercase }
+.counts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center }
+.count { display: flex; align-items: baseline; gap: 6px; padding: 6px 12px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); font-size: 13px; color: var(--muted) }
+.count b { font: 600 17px var(--font-mono); color: var(--ink); font-variant-numeric: tabular-nums }
+.whoami { font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap }
+.linkbtn { all: unset; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; color: var(--ink) }
+.linkbtn:focus-visible { outline: 3px solid var(--work) }
+
+.net { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--r); background: var(--surface); border: 1px solid var(--line); font-size: 14px }
+.net .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--done); flex: none }
+.net[data-s="off"] { border-color: var(--late) }
+.net[data-s="off"] .dot { background: var(--late) }
+.net[data-s="sync"] .dot { background: var(--work) }
+.net .grow { flex: 1; min-width: 0 }
+
+.bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 4px }
+.tabs button { border: 0; background: transparent; color: var(--muted); font: 600 14px var(--font-body); padding: 7px 12px; border-radius: 7px; cursor: pointer; display: inline-flex; gap: 6px; align-items: center }
+.tabs button[aria-pressed="true"] { background: var(--ink); color: var(--bg) }
+.tabs .n { font: 600 12px var(--font-mono) }
+
+.btn { border: 1px solid var(--line); background: var(--surface); color: var(--ink); font: 600 14px var(--font-body); padding: 9px 16px; border-radius: 8px; cursor: pointer; min-height: 40px }
+.btn:hover { border-color: var(--muted) }
+.btn.primary { background: var(--signal); color: var(--signal-ink); border-color: transparent }
+.btn.ghost { background: transparent }
+.btn.danger { color: var(--late) }
+.btn.small { min-height: 34px; padding: 6px 12px; font-size: 13px }
+.btn:disabled { opacity: .5; cursor: default }
+:focus-visible { outline: 3px solid var(--work); outline-offset: 2px }
+
+.note { padding: 12px 14px; border-radius: var(--r); border: 1px dashed var(--line); color: var(--muted); font-size: 14px }
+.note.warn { border-style: solid; border-color: var(--late); color: var(--ink) }
+
+#list { display: flex; flex-direction: column; gap: 12px }
+.task { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden }
+.task[data-status="new"] { border-left: 5px solid var(--signal) }
+.task[data-status="work"] { border-left: 5px solid var(--work) }
+.task[data-status="done"] { border-left: 5px solid var(--done) }
+.task[data-hot="1"] { border-color: color-mix(in srgb, var(--late) 45%, var(--line)); border-left: 5px solid var(--late) }
+.task-head { width: 100%; text-align: left; border: 0; background: transparent; color: inherit; padding: 14px 16px; display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; cursor: pointer; font: inherit }
+.task-title { font-size: 16px; font-weight: 600; line-height: 1.3; min-width: 0; text-wrap: balance }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 13px; color: var(--muted); grid-column: 1 / -1 }
+.chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--line); color: var(--ink); background: var(--field) }
+.chip.to-owner { border-color: var(--owner); color: var(--owner) }
+.chip.unsent { border-color: var(--late); color: var(--late) }
+.st { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; padding: 3px 9px; border-radius: 6px; white-space: nowrap; align-self: start }
+.st.new { background: var(--signal); color: var(--signal-ink) }
+.st.work { background: var(--work); color: #fff }
+.st.done { background: var(--done); color: #fff }
+.late { color: var(--late); font-weight: 600 }
+.today { color: var(--ink); font-weight: 700 }
+.chip.urgent { border-color: var(--late); background: var(--late); color: #fff }
+.progress { font-family: var(--font-mono); font-variant-numeric: tabular-nums }
+
+.task-body { border-top: 1px solid var(--line); padding: 14px 16px 16px; display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 18px }
+.col { display: flex; flex-direction: column; gap: 14px; min-width: 0 }
+.desc { white-space: pre-wrap; margin: 0; font-size: 14px; max-width: 70ch }
+.items { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; max-height: 560px; overflow-y: auto }
+.item { display: grid; grid-template-columns: auto 1fr minmax(110px, 150px); gap: 10px; align-items: center; padding: 9px 12px; border-top: 1px solid var(--line) }
+.item:first-child { border-top: 0 }
+.item.is-done { background: color-mix(in srgb, var(--done) 9%, transparent) }
+.item input[type=checkbox] { width: 22px; height: 22px; accent-color: var(--done) }
+.item .what { min-width: 0 }
+.sku { font: 600 14px var(--font-mono); word-break: break-word }
+.hint { font-size: 13px; color: var(--muted) }
+.val { display: flex; align-items: center; gap: 6px }
+.val input { width: 100%; min-width: 0 }
+.unit { font: 600 13px var(--font-mono); color: var(--muted) }
+input[type=text], input[type=number], input[type=date], input[type=password], textarea, select {
+  font: 15px var(--font-body); color: var(--ink); background: var(--field); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px }
+input[type=number] { font-family: var(--font-mono); font-variant-numeric: tabular-nums }
+textarea { width: 100%; resize: vertical; min-height: 60px }
+label.lbl { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 600; color: var(--muted) }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center }
+.saved, .who { font-size: 13px; color: var(--muted) }
+
+.thread { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--field) }
+.thread h3 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted) }
+.msgs { display: flex; flex-direction: column; gap: 8px; max-height: 380px; overflow-y: auto }
+.msg { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 14px; max-width: 95% }
+.msg.me { background: var(--mine); align-self: flex-end }
+.msg .mh { font-size: 12px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap }
+.msg .mt { white-space: pre-wrap; word-break: break-word }
+.compose { display: flex; flex-direction: column; gap: 8px }
+.compose textarea { min-height: 64px; width: 100%; background: var(--surface) }
+.compose-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center }
+.compose-row .grow { flex: 1 }
+
+/* вложения */
+.gal-box { display: flex; flex-direction: column; gap: 8px; border: 1px dashed var(--line); border-radius: 8px; padding: 10px }
+.gal-h { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted) }
+.gal { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px }
+.gal:empty { display: none }
+.gal.small { grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); margin-top: 6px }
+.att { border: 1px solid var(--line); border-radius: 8px; background: var(--field); color: var(--ink); padding: 0; cursor: pointer; overflow: hidden; font: inherit; text-align: left; position: relative }
+.att.img { aspect-ratio: 1; max-width: 100% }
+.att.img img { width: 100%; height: 100%; object-fit: cover; display: block }
+.att.doc { display: flex; flex-direction: column; gap: 2px; padding: 8px; min-height: 76px }
+.att .ext { font: 700 12px var(--font-mono); color: var(--work) }
+.att .fn { font-size: 13px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word }
+.att .fs { font-size: 12px; color: var(--muted) }
+.att.unsent { outline: 2px dashed var(--late); outline-offset: -2px }
+.dchips { display: flex; flex-wrap: wrap; gap: 6px }
+.dchips:empty { display: none }
+.dchip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px 3px 3px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font-size: 13px; max-width: 100% }
+.dchip img { width: 32px; height: 32px; object-fit: cover; border-radius: 5px }
+.dchip .fn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px }
+.task-body.dragging { outline: 3px dashed var(--work); outline-offset: -6px }
+#lb { position: fixed; inset: 0; z-index: 50; background: rgba(8, 12, 16, .92); display: flex; flex-direction: column;
+  padding: env(safe-area-inset-top, 0px) max(12px, env(safe-area-inset-right, 0px)) env(safe-area-inset-bottom, 0px) max(12px, env(safe-area-inset-left, 0px)) }
+.lb-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 0; color: #e6ebf0 }
+#lbName { flex: 1; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis }
+#lbStage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center }
+#lbImg { max-width: 100%; max-height: 100%; object-fit: contain; color: #e6ebf0 }
+@media (hover: none) { .drop-hint { display: none } }
+
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 16px; display: flex; flex-direction: column; gap: 12px }
+.grid4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px }
+#login { max-width: 420px }
+.panel h2 { margin: 0; font-size: 17px }
+.panel.narrow { max-width: 720px }
+.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px }
+
+/* сотрудники */
+.staff { display: flex; flex-direction: column; gap: 12px }
+.people { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden }
+.person { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; padding: 12px 16px; border-top: 1px solid var(--line); align-items: center }
+.person:first-child { border-top: 0 }
+.person.off { opacity: .6 }
+.person .pn { font-weight: 600; font-size: 16px }
+.person .pm { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 12px }
+.person .pa { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; align-items: center }
+.person .pinrow { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; align-items: end }
+.person .pinrow input { width: 160px }
+.chip.owner { border-color: var(--owner); color: var(--owner) }
+
+.log { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden }
+.day { padding: 8px 16px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); background: var(--field); border-top: 1px solid var(--line) }
+.day:first-child { border-top: 0 }
+.ev { display: grid; grid-template-columns: 52px 1fr; gap: 10px; padding: 9px 16px; border-top: 1px solid var(--line); font-size: 14px }
+.ev time { font: 600 13px var(--font-mono); color: var(--muted); font-variant-numeric: tabular-nums }
+.ev .t { min-width: 0 }
+
+@media (max-width: 760px) { .task-body { grid-template-columns: 1fr } .grid4 { grid-template-columns: 1fr 1fr } .grid3 { grid-template-columns: 1fr } .person { grid-template-columns: 1fr } .person .pa { justify-content: flex-start } }
+@media (max-width: 480px) { .grid4 { grid-template-columns: 1fr } .item { grid-template-columns: auto 1fr } .item .val { grid-column: 2 } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="tape" aria-hidden="true"></div>
+    <div class="head-row">
+      <h1><small>Склад</small>Задания и переписка</h1>
+      <div class="counts" id="counts" aria-live="polite" hidden>
+        <span class="count">новые <b id="cNew">0</b></span>
+        <span class="count">в работе <b id="cWork">0</b></span>
+        <span class="count">готово <b id="cDone">0</b></span>
+      </div>
+    </div>
+    <div class="net" id="net" data-s="ok" aria-live="polite">
+      <span class="dot" aria-hidden="true"></span>
+      <span class="grow" id="netText">Загружаю…</span>
+      <button class="btn small ghost" id="retry" hidden>Отправить сейчас</button>
+    </div>
+  </header>
+
+  <form id="login" class="panel" hidden>
+    <label class="lbl">Кто вы
+      <select id="lgName" required></select>
+    </label>
+    <label class="lbl">PIN
+      <input type="password" id="lgPin" inputmode="numeric" autocomplete="current-password" required minlength="4" maxlength="8">
+    </label>
+    <div class="actions"><button class="btn primary" type="submit" id="lgBtn">Войти</button><span class="saved" id="lgMsg"></span></div>
+  </form>
+
+  <main id="app" hidden>
+    <div class="bar">
+      <div class="tabs" role="group" aria-label="Что показать">
+        <button data-tab="stock" aria-pressed="true">Складу <span class="n" id="nStock"></span></button>
+        <button data-tab="owner" aria-pressed="false">Владельцу <span class="n" id="nOwner"></span></button>
+        <button data-tab="done" aria-pressed="false">Сделано</button>
+        <button data-tab="log" aria-pressed="false">Журнал</button>
+        <button data-tab="staff" aria-pressed="false" id="tabStaff" hidden>Сотрудники</button>
+      </div>
+      <div class="actions">
+        <span class="whoami"><span id="meName"></span><button class="linkbtn" id="myPinBtn" type="button">сменить PIN</button><button class="linkbtn" id="logout" type="button">выйти</button></span>
+        <button class="btn" id="installBtn" type="button" hidden>Установить приложение</button>
+        <button class="btn" id="pushBtn" type="button" hidden>Включить уведомления</button>
+        <button class="btn primary" id="toggleNew" type="button">+ Новое задание</button>
+      </div>
+    </div>
+
+    <form id="newForm" class="panel" hidden>
+      <label class="lbl">Что сделать
+        <input type="text" id="nfTitle" required maxlength="200" placeholder="Например: пересчитать остаток ниппелей 14 мм">
+      </label>
+      <div class="grid4">
+        <label class="lbl">Кому
+          <select id="nfTo"><option value="stock">Складу</option><option value="owner">Владельцу</option></select>
+        </label>
+        <label class="lbl">Тип
+          <select id="nfKind">
+            <option value="weigh">Взвесить</option>
+            <option value="photo">Сфотографировать</option>
+            <option value="count">Пересчитать</option>
+            <option value="check">Проверить</option>
+            <option value="order">Заказать / докупить</option>
+            <option value="other">Другое</option>
+          </select>
+        </label>
+        <label class="lbl">Срок <input type="date" id="nfDue"></label>
+        <label class="lbl">Важность
+          <select id="nfPrio"><option value="0">Обычная</option><option value="1">Срочно</option></select>
+        </label>
+      </div>
+      <label class="lbl">Подробности
+        <textarea id="nfDesc" rows="3" placeholder="Как сделать, что нужно в ответ"></textarea>
+      </label>
+      <label class="lbl">Позиции — по одной в строке: артикул или название, потом через тире подсказка (можно оставить пустым)
+        <textarea id="nfItems" rows="3" placeholder="UCP14C.290.B — 1 шт., весы 0,01 г&#10;TB354.285"></textarea>
+      </label>
+      <div class="lbl">Образцы — фото и файлы «сделать как здесь» (можно перетащить сюда или вставить скриншот Ctrl+V)
+        <div class="actions">
+          <label class="btn small ghost">Сфотографировать<input type="file" accept="image/*" capture="environment" hidden id="nfCam"></label>
+          <label class="btn small ghost">Приложить файлы<input type="file" multiple hidden id="nfFile"></label>
+        </div>
+        <div class="dchips" id="nfChips"></div>
+      </div>
+      <div class="actions">
+        <button class="btn primary" type="submit">Создать задание</button>
+        <button class="btn ghost" type="button" id="nfCancel">Отмена</button>
+      </div>
+    </form>
+
+    <form id="myPin" class="panel narrow" hidden>
+      <h2>Сменить свой PIN</h2>
+      <div class="grid3">
+        <label class="lbl">Текущий PIN <input type="password" id="mpOld" inputmode="numeric" autocomplete="current-password" required maxlength="8"></label>
+        <label class="lbl">Новый PIN, 6–8 цифр <input type="password" id="mpNew" inputmode="numeric" autocomplete="new-password" required pattern="\d{6,8}" maxlength="8"></label>
+        <label class="lbl">Новый ещё раз <input type="password" id="mpNew2" inputmode="numeric" autocomplete="new-password" required pattern="\d{6,8}" maxlength="8"></label>
+      </div>
+      <div class="actions"><button class="btn primary" type="submit" id="mpBtn">Сменить</button><button class="btn ghost" type="button" id="mpCancel">Отмена</button><span class="saved" id="mpMsg"></span></div>
+      <div class="hint">На других телефонах и компьютерах, где вы входили, придётся войти заново с новым PIN. Здесь вход сохранится.</div>
+    </form>
+
+    <div id="status" class="note" hidden></div>
+    <div id="list"></div>
+    <div id="log" class="log" hidden></div>
+    <section id="staff" class="staff" hidden aria-label="Сотрудники"></section>
+  </main>
+</div>
+<div id="lb" role="dialog" aria-modal="true" aria-label="Просмотр фото" hidden>
+  <div class="lb-bar">
+    <span id="lbName"></span>
+    <button class="btn small" id="lbPrev" type="button" aria-label="Предыдущее">‹</button>
+    <button class="btn small" id="lbNext" type="button" aria-label="Следующее">›</button>
+    <button class="btn small" id="lbDl" type="button">Скачать</button>
+    <button class="btn small danger" id="lbDel" type="button">Удалить</button>
+    <button class="btn small primary" id="lbClose" type="button">Закрыть</button>
+  </div>
+  <div id="lbStage"><img id="lbImg" alt=""></div>
+</div>
+<script src="app.js?v=7"></script>
+</body>
+</html>
